@@ -23,9 +23,10 @@ likely belongs to the same paradigm.
 
 For testing this project, a [gensim](http://radimrehurek.com/gensim/)
 skip-gram model was trained on the 
-[Wikicorpus](http://www.cs.upc.edu/~nlp/wikicorpus/). It is not clear whether a
+[Wikicorpus](http://www.cs.upc.edu/~nlp/wikicorpus/). (It is not clear whether a
 skip-gram model's accuracy exceeds that of a continuous bag of words for
-the purposes of this project. What is clear (and, perhaps, obvious), is that
+the purposes of this project, this may be tested at a later stage.) 
+What is clear (and, perhaps, obvious), is that
 the corpus on which the model is trained needs to be quite large -- the larger,
 the more accurate the results will be.
 
