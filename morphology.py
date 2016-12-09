@@ -14,6 +14,7 @@ import Levenshtein as lev
 import numpy as np
 from gensim.models.word2vec import Word2Vec
 from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 
 TokenMatch = namedtuple('TokenMatch', ['token1', 'token2',
@@ -33,6 +34,7 @@ class Affix(Enum):
 WORD_START = '*'
 WORD_END = '#'
 DIFF_BOUNDARY = '-'
+STEM_BOUNDARY = '_'
 
 def get_args():
     parser = ArgumentParser()
@@ -122,6 +124,8 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
 
     >>> get_same_and_diffs('erie', 'eerie')
     ('erie', ['-'], ['e-'])
+    >>> get_same_and_diffs('q_t_l', 'q_tlit')  # doctest: +SKIP
+    ('q_t_l', ['---'], ['---', '-i-'])
 
     :param w1: str
     :param w2: str
@@ -153,13 +157,18 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
             if current_diff1:
                 # prepend the boundary
                 # in case this diff is non-concatenative
-                current_diff1.append(DIFF_BOUNDARY)
+                # or prefix
+                if current_diff1[-1] != DIFF_BOUNDARY:
+                    current_diff1.append(DIFF_BOUNDARY)
+
                 diff1 = ''.join(current_diff1)
                 diffs1.append(diff1)
                 current_diff1.clear()
 
             if current_diff2:
-                current_diff2.append(DIFF_BOUNDARY)
+                if current_diff2[-1] != DIFF_BOUNDARY:
+                    current_diff2.append(DIFF_BOUNDARY)
+
                 diff2 = ''.join(current_diff2)
                 diffs2.append(diff2)
                 current_diff2.clear()
@@ -205,7 +214,7 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
         diff2 = ''.join(current_diff2)
         diffs2.append(diff2)
 
-    same = DIFF_BOUNDARY.join(sames)
+    same = DIFF_BOUNDARY.join(sames)  # test
 
     return same, diffs1, diffs2
 
@@ -362,23 +371,46 @@ def get_cossim(vector1, vector2):
     return cossim.ravel()[0]
 
 
-def vector_mean(*vectors: Iterable[np.ndarray]) -> np.ndarray:
+def get_vector_mean(*vectors: Iterable[np.ndarray]) -> np.ndarray:
     vector_sum = sum(vectors)
     return vector_sum / len(vectors)
 
 
 def stems_match(stem1, stem2,
-                stem2vec, threshold=0.75):
+                stem2vecs, threshold=0.75):
+    """
+    >>> stem1 = 'suggest'
+    >>> stem2 = 'suggesti'
+    >>> stem2vecs = {stem1: [np.array([1])], stem2: [np.array([1])]}
+    >>> stems_match(stem1, stem2, stem2vecs)
+    True
+    >>> stem1 = 'become'
+    >>> stem2 = 'became'
+    >>> stem2vecs = {stem1: [np.array([0.85])]}
+
+    :param stem1:
+    :param stem2:
+    :param stem2vecs:
+    :param threshold:
+    :return:
+    """
 
     # we need to build a 'ladder' of tests
     # ascending in order of their computational complexity
-    shorter = len(stem1) < len(stem2)
-    if shorter:
+    # they could also be equal to account for things like 'come'/'came'
+
+    shorter = len(stem1) <= len(stem2)
+    if shorter and stem1 != stem2:
         substem = is_substem(stem1, stem2)
         if substem:
             string_similarity = lev.ratio(stem1, stem2)
-            if string_similarity:
-                vector_similarity = get_cossim(stem2vec[stem1], stem2vec[stem2])
+            if string_similarity >= threshold:
+
+                # FIXME: temporary, until we detect outliers
+                mean1 = get_vector_mean(*stem2vecs[stem1])
+                mean2 = get_vector_mean(*stem2vecs[stem2])
+
+                vector_similarity = get_cossim(mean1, mean2)
                 pass_threshold = are_similar(string_similarity,
                                              vector_similarity,
                                              threshold=threshold)
@@ -490,13 +522,8 @@ def stems_match(stem1, stem2,
 #
 #     return stems_to_affixes, affixes_to_stems, stem_counter, affix_counter
 
-
-
-
 def get_stems(matches: Iterable[TokenMatch]):
     logging.info('Building sets of stems and words...')
-
-    stem2vec = {}
 
     # stems is a dictionary
     # where every stem points to an ID (index)
@@ -506,29 +533,41 @@ def get_stems(matches: Iterable[TokenMatch]):
     # to reflect the changed stem
     stem2words = defaultdict(set)
 
+    stem2vecs = defaultdict(list)
+
+    # a set to store which tokens' vectors
+    # we have already stored
+    # to make sure we don't fill stem2vecs with duplicates
+    # this will be stored as tuples (stem, token)
+    # because we want to account for vectors
+    # occurring with different stems
+    stored_vecs = set()
+
     for match in matches:
         same, diffs1, diffs2 = get_same_and_diffs(match.token1, match.token2)
         # this_signature = diffs1 + diffs2
         # assert isinstance(this_signature, list)
 
-        combined_vector = vector_mean(match.vector1, match.vector2)
         new_stem = same
 
         # add the stem and its signature to stems
         stem2words[new_stem].update((match.token1, match.token2))
 
-        stem2vec[new_stem] = combined_vector
+        if (new_stem, match.token1) not in stored_vecs:
+            stem2vecs[new_stem].append(match.vector1)
+        if (new_stem, match.token2) not in stored_vecs:
+            stem2vecs[new_stem].append(match.vector2)
     
-    return stem2words, stem2vec
+    return stem2words, stem2vecs
 
 
 def consolidate_stems(stems2words: Dict[str, Set[str]],
-                      stem2vec: Dict[str, Collection]):
+                      stem2vecs: Dict[str, Collection]):
     """
     >>> stems_to_words = {'suggest': {'suggesting', 'suggests'},
     ... 'suggesti': {'suggesting', 'suggestive'}} # doctest: +ELLIPSIS
-    >>> stem2vec = {'suggest': np.array([1]), 'suggesti': np.array([1])}
-    >>> stems_to_affixes = consolidate_stems(stems_to_words, stem2vec) # doctest: +ELLIPSIS
+    >>> stem2vecs = {'suggest': [np.array([1])], 'suggesti': [np.array([1])]}
+    >>> stems_to_affixes = consolidate_stems(stems_to_words, stem2vecs) # doctest: +ELLIPSIS
     ... # doctest: +ELLIPSIS
     >>> stems_to_affixes == {'suggest': {'suggests', 'suggesting', 'suggestive'}}
     True
@@ -555,7 +594,7 @@ def consolidate_stems(stems2words: Dict[str, Set[str]],
             # and have a high Levenshtein ratio
             # with this stem
             shorter_stems = [stem for stem in adjusted_s2a
-                             if stems_match(stem, candidate, stem2vec)]
+                             if stems_match(stem, candidate, stem2vecs)]
 
             if shorter_stems:
                 has_changed = True
@@ -569,14 +608,14 @@ def consolidate_stems(stems2words: Dict[str, Set[str]],
 
                     # update the words and the associated stems
 
-                    new_vector = vector_mean(stem2vec[stem], stem2vec[candidate])
+                    # new_vector = get_vector_mean(stem2vec[stem], stem2vec[candidate])
                     adjusted_s2a[new_stem].update(words)
 
                     # update the vector average for the stem
-                    stem2vec[new_stem] = new_vector
+                    # stem2vec[new_stem] = new_vector
 
                     del adjusted_s2a[candidate]
-                    del stem2vec[candidate]
+                    # del stem2vec[candidate]
 
                     break
 
