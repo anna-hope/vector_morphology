@@ -1,5 +1,7 @@
 from argparse import ArgumentParser
 from collections import namedtuple, defaultdict, Counter
+from difflib import SequenceMatcher
+from enum import Enum
 from itertools import combinations
 import logging
 from math import factorial
@@ -20,6 +22,14 @@ TokenMatch = namedtuple('TokenMatch', ['token1', 'token2',
                                        'vector_similarity'])
 
 
+class Affix(Enum):
+    Prefix = 0
+    Suffix = 1
+    Infix = 2
+    Circumfix = 3
+    Transfix = 4
+
+
 WORD_START = '*'
 WORD_END = '#'
 DIFF_BOUNDARY = '-'
@@ -31,7 +41,24 @@ def get_args():
     return args
 
 
-def get_matches(model, string_threshold=0.75, vector_threshold=0.65):
+def are_similar(string_similarity, vector_similarity,
+                vector_weight=2, string_weight=1,
+                threshold=0.7):
+
+    # compute the similarity
+    # as a weighted mean of the Levenshtein ratio
+    # and vector cosine similarity
+    # at a ratio of 2:1
+
+    similarity_num = (vector_similarity * vector_weight +
+                      string_similarity * string_weight)
+
+    similarity_denom = vector_weight + string_weight
+    similarity = similarity_num / similarity_denom
+    return similarity >= threshold
+
+
+def get_matches(model, string_threshold=0.75, combined_threshold=0.7):
     counts = (entry.count for entry in model.vocab.values())
     mean_count = mean(counts)
 
@@ -42,26 +69,48 @@ def get_matches(model, string_threshold=0.75, vector_threshold=0.65):
     num_combinations = factorial(len(vocab)) // 2 
     num_combinations //= factorial(len(vocab) - 2)
 
+    seq_matcher = SequenceMatcher()
     for token1, token2 in tqdm(combinations(vocab, 2),
                                total=num_combinations):
         if token1.isalpha() and token2.isalpha():
-            string_similarity = lev.ratio(token1, token2)
 
-            if string_similarity >= string_threshold:
-                try:
-                    vector_similarity = model.similarity(token1, token2)
-                except KeyError:
-                    # casefolded token doesn't exist in the vocab
-                    # skip
-                    continue
+            # initial check to make sure
+            # we are not comparing completely implausible things
+            if lev.ratio(token1, token2) >= 0.5:
 
-                if vector_similarity >= vector_threshold:
-                    vector1, vector2 = model[token1], model[token2]
+                # we will now use Sequence Matcher
+                # because its algorithm is often better
+                # for purposes of picking up non-concatenative similarity
+                # (e.g Semitic)
 
-                    yield TokenMatch(token1, token2,
-                                     vector1, vector2,
-                                     string_similarity,
-                                     vector_similarity)
+                # SequenceMatcher caches the second sequence
+                # and, with combinations, the first token will occur more often
+                if seq_matcher.b != token1:
+                    seq_matcher.set_seq2(token1)
+
+                seq_matcher.set_seq1(token2)
+
+                string_similarity = seq_matcher.quick_ratio()
+
+                if string_similarity >= string_threshold:
+                    try:
+                        vector_similarity = model.similarity(token1, token2)
+                    except KeyError:
+                        # casefolded token doesn't exist in the vocab
+                        # skip
+                        continue
+
+                    passes_threshold = are_similar(string_similarity,
+                                                   vector_similarity,
+                                                   threshold=combined_threshold)
+
+                    if passes_threshold:
+                        vector1, vector2 = model[token1], model[token2]
+
+                        yield TokenMatch(token1, token2,
+                                         vector1, vector2,
+                                         string_similarity,
+                                         vector_similarity)
 
 
 def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
@@ -71,13 +120,15 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
     >>> get_same_and_diffs('suggest', 'suggests')
     ('suggest', ['-'], ['-s'])
 
-    >>> get_same_and_diffs('erie', 'eerie') # doctest: +SKIP
+    >>> get_same_and_diffs('erie', 'eerie')
     ('erie', ['-'], ['e-'])
 
     :param w1: str
     :param w2: str
     :return:
     """
+
+    seq_matcher = SequenceMatcher(a=w1, b=w2)
 
     # sames and diffs can be non-concatenative
     sames = []
@@ -86,7 +137,8 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
 
     # NOTE: opcodes can be
     # equal, delete, insert, replace
-    opcodes = lev.opcodes(w1, w2)
+    # opcodes = lev.opcodes(w1, w2)
+    opcodes = seq_matcher.get_opcodes()
 
     # we need to keep track of the current diff
     # because opcode names can differ
@@ -153,22 +205,7 @@ def get_same_and_diffs(w1: str, w2: str) -> Tuple[str, List[str], List[str]]:
         diff2 = ''.join(current_diff2)
         diffs2.append(diff2)
 
-    # if one of the strings ends with the other
-    # (e.g. 'erie' and 'eerie')
-    # then Levenshtein opcodes will return ('equal', ... 'insert')
-    # we don't want this behaviour
-    # because it would complicate things down the line
-    # so we need to treat every case like this as a prefix
-
-    # the easiest solution is to reverse the input strings
-    # and then reverse the 'same' and diffs back in the output
-
-    if w1.endswith(w2) or w2.endswith(w1):
-        same = ''.join(sames)
-        # FIXME
-
-    else:
-        same = DIFF_BOUNDARY.join(sames)
+    same = DIFF_BOUNDARY.join(sames)
 
     return same, diffs1, diffs2
 
@@ -339,10 +376,13 @@ def stems_match(stem1, stem2,
     if shorter:
         substem = is_substem(stem1, stem2)
         if substem:
-            strings_close = lev.ratio(stem1, stem2) >= threshold
-            if strings_close:
-                vectors_close = get_cossim(stem2vec[stem1], stem2vec[stem2])
-                if vectors_close:
+            string_similarity = lev.ratio(stem1, stem2)
+            if string_similarity:
+                vector_similarity = get_cossim(stem2vec[stem1], stem2vec[stem2])
+                pass_threshold = are_similar(string_similarity,
+                                             vector_similarity,
+                                             threshold=threshold)
+                if pass_threshold:
                     return True
 
     return False
@@ -551,6 +591,66 @@ def consolidate_stems(stems2words: Dict[str, Set[str]],
     return stems2words
 
 
+def get_affix_type(affix: str) -> Affix:
+    """
+    >>> affix_type = get_affix_type(f's{DIFF_BOUNDARY}') # doctest: +ELLIPSIS
+    ... # doctest: +ELLIPSIS
+    >>> affix_type == Affix.Prefix
+    True
+    >>> affix_type = get_affix_type(f'{DIFF_BOUNDARY}s')
+    >>> affix_type == Affix.Suffix
+    True
+    >>> affix_type = get_affix_type(f'{DIFF_BOUNDARY}s{DIFF_BOUNDARY}')
+    >>> affix_type == Affix.Infix
+    True
+    >>> affix_type = get_affix_type(f's{DIFF_BOUNDARY}s')
+    >>> affix_type == Affix.Circumfix
+    True
+    >>> db = DIFF_BOUNDARY
+    >>> affix = f'{db}a{db}u{db}'  # transfix (e.g. Arabic)
+    >>> affix_type = get_affix_type(affix)
+    >>> affix_type == Affix.Transfix
+    True
+    >>> affix = '{db}'
+    >>> get_affix_type(affix)  # doctest: +IGNORE_EXCEPTION_DETAIL
+    Traceback (most recent call last):
+        ...
+    ValueError:
+
+    :param affix: str
+    :return: Affix
+    """
+
+    split_affix = affix.split(DIFF_BOUNDARY)
+    # print(affix, split_affix)
+
+    # transfix is the special case
+    # most likely, you will have more than 3 splits
+    # because there will be more than two diff boundaries
+    # e.g. '-a-u-' will turn into ['', 'a', '', 'u', '']
+    if len(split_affix) < 2:
+        raise ValueError(f'"{affix}" matches no pattern.')
+
+    elif len(split_affix) > 3:
+        return Affix.Transfix
+    else:
+        first, last = split_affix[0], split_affix[-1]
+
+        if first and not last:
+            # prefix
+            return Affix.Prefix
+        elif last and not first:
+            # suffix
+            return Affix.Suffix
+        elif not first and not last:
+            # infix
+            return Affix.Infix
+        elif first and last:
+            return Affix.Circumfix
+        else:
+            raise ValueError(f'"{affix}" matches no pattern.')
+
+
 def build_signatures(stems2words: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
     """
     Builds signatures from stems and their associated words.
@@ -561,6 +661,14 @@ def build_signatures(stems2words: Dict[str, Set[str]]) -> Dict[str, Set[str]]:
     stems2affixes = defaultdict(set)
 
     for stem, words in stems2words.items():
+
+        prefixes = []  # \s+DIFF_BOUNDARY
+        suffixes = []  # DIFF_BOUNDARY\s+
+        circumfixes = []  # \s+DIFF_BOUNDARY\s+
+        infixes = []  # DIFF_BOUNDARY\s+DIFF_BOUNDARY
+
+        # NOTE: a circumfix is a prefix+suffix combination
+        # that seems to only occur together
 
         # sanity check
         assert stem not in stems2affixes
